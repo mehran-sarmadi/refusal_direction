@@ -15,6 +15,7 @@ import argparse
 import gc
 import json
 import random
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -55,20 +56,24 @@ def append_jsonl(path: Path, rows: list[dict]):
             f.write(json.dumps(r) + "\n")
 
 
-def free_gpu(*objs):
-    for o in objs:
-        del o
+def free_gpu():
+    """Call after `del model` in the caller (deleting a parameter here would not free it)."""
     gc.collect()
     torch.cuda.empty_cache()
 
 
-def load_model(name: str, dtype: torch.dtype):
+def load_model(name: str, dtype: torch.dtype, load_4bit: bool = False):
     cfg = AutoConfig.from_pretrained(name)
     if hasattr(cfg, "vision_config"):  # gemma-3-4b-it is multimodal; we only use its text path
         from transformers import Gemma3ForConditionalGeneration as cls
     else:
         cls = AutoModelForCausalLM
-    model = cls.from_pretrained(name, torch_dtype=dtype, device_map="cuda", attn_implementation="eager")
+    kw = {}
+    if load_4bit:  # needed for gemma-3-12b-it on a 16 GB T4 (bf16 weights alone are ~24 GB)
+        from transformers import BitsAndBytesConfig
+        kw["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=dtype)
+    model = cls.from_pretrained(name, torch_dtype=dtype, device_map="cuda", attn_implementation="eager", **kw)
     model.eval()
     tok = AutoTokenizer.from_pretrained(name, padding_side="left")
     if tok.pad_token is None:  # Llama-Guard-3 ships without a pad token; safe with left padding + attention mask
@@ -94,14 +99,15 @@ def stage_generate(args, prompts):
         print(f"[generate] {role} ({name}): {len(done)} cached, {len(todo)} to go")
         if not todo:
             continue
-        model, tok = load_model(name, dtype)
+        model, tok = load_model(name, dtype, load_4bit=(role == "teacher" and args.teacher_4bit))
         bs = args.batch_size_teacher if role == "teacher" else args.batch_size_student
         for i in tqdm(range(0, len(todo), bs), desc=role):
             batch = todo[i:i + bs]
             chats = [[{"role": "user", "content": p["instruction"]}] for p in batch]
             resps = generate_batch(model, tok, chats, args.max_new_tokens)
             append_jsonl(path, [{"id": p["id"], "response": r.strip()} for p, r in zip(batch, resps)])
-        free_gpu(model)
+        del model
+        free_gpu()
 
 
 def stage_judge(args, prompts):
@@ -129,7 +135,8 @@ def stage_judge(args, prompts):
                                  "harmful": o.strip().lower().startswith("unsafe")}
                                 for g, o in zip(batch, outs)])
     if model is not None:
-        free_gpu(model)
+        del model
+        free_gpu()
 
 
 def stage_analyze(args, prompts):
@@ -153,6 +160,8 @@ def stage_analyze(args, prompts):
     missing = len(prompts) - len(rows)
     if missing:
         print(f"[analyze] WARNING: {missing} prompts lack generations/judgements and are excluded")
+    if not rows:
+        raise SystemExit("[analyze] no prompt has generations + judgements for both models; run generate/judge first")
     df = pd.DataFrame(rows)
 
     df.to_csv(args.out / "responses.csv", index=False)
@@ -166,7 +175,7 @@ def stage_analyze(args, prompts):
         v[f"{r}_refused_but_guard_unsafe"] = int((df[f"{r}_refusal"] & df[f"{r}_guard_unsafe"]).sum())
     df[(df.teacher_refusal & df.teacher_guard_unsafe) | (df.student_refusal & df.student_guard_unsafe)] \
         .to_csv(args.out / "review_refused_but_unsafe.csv", index=False)
-    v["config"] = {"models": MODELS, "judge": JUDGE, "dtype": args.dtype,
+    v["config"] = {"models": MODELS, "teacher_4bit": args.teacher_4bit, "judge": JUDGE, "dtype": args.dtype,
                    "max_new_tokens": args.max_new_tokens, "seed": args.seed, "dataset": str(args.dataset)}
     (args.out / "verdict.json").write_text(json.dumps(v, indent=2))
 
@@ -178,6 +187,20 @@ def stage_analyze(args, prompts):
     print("\n=== Verdict ===")
     print(json.dumps({k: v[k] for k in v if k != "config"}, indent=2))
     return df, summary, dis, v
+
+
+def check_run_config(args):
+    """Cached generations are keyed by role, so refuse to mix models within one --out dir."""
+    path = args.out / "run_config.json"
+    cfg = {"teacher": args.teacher, "student": args.student, "teacher_4bit": args.teacher_4bit,
+           "max_new_tokens": args.max_new_tokens, "dtype": args.dtype}
+    if path.exists():
+        old = json.loads(path.read_text())
+        if old != cfg:
+            raise SystemExit(f"{args.out} holds results for {old}, not {cfg}. Use a different --out.")
+    elif any(args.out.glob("generations_*.jsonl")):
+        print(f"[warn] {args.out} has cached generations but no run_config.json; assuming they match {cfg}")
+    path.write_text(json.dumps(cfg, indent=2))
 
 
 def parse_args(argv=None):
@@ -194,6 +217,11 @@ def parse_args(argv=None):
                     help="Gemma 3 overflows in float16, so it is not offered")
     ap.add_argument("--margin-pp", type=float, default=5.0, help="min Harmful-rate gap for a Safety advantage")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--teacher", default=MODELS["teacher"], help="e.g. google/gemma-3-12b-it")
+    ap.add_argument("--student", default=MODELS["student"])
+    ap.add_argument("--teacher-4bit", action="store_true", help="load the teacher in 4-bit NF4 (needed for 12B on a T4)")
+    ap.add_argument("--reuse-student-from", type=Path, default=None,
+                    help="copy cached student generations/judgements from an earlier --out dir")
     return ap.parse_args(argv)
 
 
@@ -201,6 +229,14 @@ def main(argv=None):
     args = parse_args(argv)
     set_seed(args.seed)
     args.out.mkdir(parents=True, exist_ok=True)
+    MODELS.update(teacher=args.teacher, student=args.student)
+    check_run_config(args)
+    if args.reuse_student_from:
+        for f in ("generations_student.jsonl", "judgements_student.jsonl"):
+            src, dst = args.reuse_student_from / f, args.out / f
+            if src.exists() and not dst.exists():
+                shutil.copy(src, dst)
+                print(f"reused {src}")
     prompts = load_prompts(args.dataset, args.limit)
     print(f"{len(prompts)} harmful prompts from {args.dataset}")
     if args.stage in ("generate", "all"):

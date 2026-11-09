@@ -4,3 +4,4 @@ accelerate>=0.34
 pandas
 scipy
 tqdm
+bitsandbytes>=0.45

@@ -26,3 +26,11 @@ python -m kd.step1_behavior.run all            # add --limit 8 for a smoke test
 | `verdict.json` | rates, gap, CI, McNemar, verdict, config |
 
 Unit tests (no GPU): `pytest kd/step1_behavior/test_analysis.py`
+
+## Bigger teacher (gemma-3-12b-it)
+bf16 weights (~24 GB) do not fit a T4, so load in 4-bit NF4, which is a small confound vs the bf16 4B run.
+```
+python -m kd.step1_behavior.run all --teacher google/gemma-3-12b-it --teacher-4bit \
+  --batch-size-teacher 8 --reuse-student-from kd/step1_behavior/results --out kd/step1_behavior/results_12b
+```
+Each `--out` dir records its models in `run_config.json` and refuses to mix cached outputs from different models.

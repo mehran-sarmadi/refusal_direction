@@ -6,3 +6,4 @@ venv
 docs/paper/*.pdf
 kd/step1_behavior/results/
 __pycache__/
+kd/step1_behavior/results_*/
