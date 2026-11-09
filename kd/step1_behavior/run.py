@@ -71,6 +71,8 @@ def load_model(name: str, dtype: torch.dtype):
     model = cls.from_pretrained(name, torch_dtype=dtype, device_map="cuda", attn_implementation="eager")
     model.eval()
     tok = AutoTokenizer.from_pretrained(name, padding_side="left")
+    if tok.pad_token is None:  # Llama-Guard-3 ships without a pad token; safe with left padding + attention mask
+        tok.pad_token = tok.eos_token
     return model, tok
 
 
@@ -79,7 +81,7 @@ def generate_batch(model, tok, chats: list[list[dict]], max_new_tokens: int, **t
     texts = [tok.apply_chat_template(c, tokenize=False, add_generation_prompt=True, **template_kwargs) for c in chats]
     enc = tok(texts, return_tensors="pt", padding=True, add_special_tokens=False).to(model.device)
     out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
-                         pad_token_id=tok.pad_token_id or tok.eos_token_id)
+                         pad_token_id=tok.pad_token_id)
     return tok.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
 
 
