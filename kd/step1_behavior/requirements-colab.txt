@@ -1,0 +1,6 @@
+# Step 1 only. Separate from the root requirements.txt (transformers 4.44 cannot load Gemma 3).
+transformers>=4.50,<5
+accelerate>=0.34
+pandas
+scipy
+tqdm
